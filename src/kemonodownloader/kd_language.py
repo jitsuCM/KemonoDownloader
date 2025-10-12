@@ -957,7 +957,19 @@ class KDLanguage:
                 "korean": "대기 중",
                 "chinese-simplified": "空闲"
             },
-            
+            "thread_monitor": {
+                "english": "Thread Monitor",
+                "japanese": "スレッドモニター",
+                "korean": "스레드 모니터",
+                "chinese-simplified": "线程监视器"
+            },
+            "show_thread_monitor": {
+                "english": "Show thread monitor",
+                "japanese": "スレッドモニターを表示",
+                "korean": "스레드 모니터 표시",
+                "chinese-simplified": "显示线程监视器"
+            },
+
             # Tab names
             "post_downloader_tab": {
                 "english": "Post Downloader",
@@ -983,7 +995,45 @@ class KDLanguage:
                 "korean": "도움말",
                 "chinese-simplified": "帮助"
             },
-            
+
+            # Statistics window
+            "statistics_window_title": {
+                "english": "Download Statistics",
+                "japanese": "ダウンロード統計",
+                "korean": "다운로드 통계",
+                "chinese-simplified": "下载统计"
+            },
+            "stats_general_tab": {
+                "english": "General",
+                "japanese": "全般",
+                "korean": "일반",
+                "chinese-simplified": "常规"
+            },
+            "stats_images_tab": {
+                "english": "Images",
+                "japanese": "画像",
+                "korean": "이미지",
+                "chinese-simplified": "图片"
+            },
+            "stats_videos_tab": {
+                "english": "Videos",
+                "japanese": "動画",
+                "korean": "비디오",
+                "chinese-simplified": "视频"
+            },
+            "stats_creators_tab": {
+                "english": "Creators",
+                "japanese": "クリエイター",
+                "korean": "크리에이터",
+                "chinese-simplified": "创作者"
+            },
+            "view_statistics": {
+                "english": "View Statistics",
+                "japanese": "統計を表示",
+                "korean": "통계 보기",
+                "chinese-simplified": "查看统计"
+            },
+
             # Common buttons and actions
             "add_to_queue": {
                 "english": "Add to Queue",

@@ -15,6 +15,9 @@ import qtawesome as qta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from kemonodownloader.kd_language import translate
+from kemonodownloader.kd_link_handler import extract_links, format_links_file
+from kemonodownloader.kd_utils import hash_file_chunked, HashStorage
+from kemonodownloader.kd_stats import StatsDatabase
 import locale
 import ctypes
 from fake_useragent import UserAgent
@@ -395,12 +398,12 @@ class FilterThread(QThread):
             if not self.search_text or self.search_text in post_title.lower():
                 is_checked = self.checked_urls.get(post_id, False)
                 filtered_items.append((post_title, post_id, thumbnail_url, is_checked))
-                self.log.emit(translate("log_debug", translate("filtered_post", post_title, post_id)), "INFO")
         self.finished.emit(filtered_items)
 
 class FilePreparationThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(list, dict)
+    links_extracted = pyqtSignal(str, dict)  # post_id, links_dict
     log = pyqtSignal(str, str)
     error = pyqtSignal(str)
 
@@ -486,7 +489,7 @@ class FilePreparationThread(QThread):
         domain_config = get_domain_config(creator_url)
         api_url = f"{domain_config['api_base']}/{service}/user/{creator_id}/post/{post_id}"
         max_retries = self.settings.post_data_max_retries
-        retry_delay_seconds = 5
+        retry_delay_seconds = 20
         for attempt in range(1, max_retries + 1):
             try:
                 headers = HEADERS.copy()
@@ -504,10 +507,15 @@ class FilePreparationThread(QThread):
                 post_data = response.json()
                 post = post_data if isinstance(post_data, dict) and 'post' not in post_data else post_data.get('post', {})
                 self.log.emit(translate("log_debug", translate("post_data_for_id", post_id, json.dumps(post, indent=2))), "INFO")
+
+                # Extract links from post content
+                post_content = post.get('content', '')
+                extracted_links = extract_links(post_content)
+
                 allowed_extensions = [ext.lower() for ext, checkbox in self.creator_ext_checks.items() if checkbox.isChecked()]
                 detected_files = self.detect_files(post, allowed_extensions, domain_config)
                 files_to_download = [(file_name, file_url) for file_name, file_url in detected_files]
-                return (post_id, files_to_download)
+                return (post_id, files_to_download, extracted_links)
             except Exception as e:
                 if attempt == max_retries:
                     self.log.emit(translate("log_error", translate("error_fetching_post_max_attempts", post_id, max_retries, str(e))), "ERROR")
@@ -553,7 +561,12 @@ class FilePreparationThread(QThread):
                     break
                 result = future.result()
                 if result:
-                    post_id, detected_files = result
+                    post_id, detected_files, extracted_links = result
+
+                    # Emit extracted links for this post
+                    if extracted_links and any(extracted_links.values()):
+                        self.links_extracted.emit(post_id, extracted_links)
+
                     for file_name, file_url in detected_files:
                         self.log.emit(translate("log_debug", translate("detected_file", file_name, file_url)), "INFO")
                         files_to_download.append(file_url)
@@ -588,13 +601,15 @@ def sanitize_filename(name, max_length=100):
     return sanitized if sanitized else "unnamed"
 
 class CreatorDownloadThread(QThread):
-    file_progress = pyqtSignal(int, int) 
-    file_completed = pyqtSignal(int, str, bool)  # Added success flag
+    file_progress = pyqtSignal(int, int)
+    file_completed = pyqtSignal(int, str, bool, str)  # file_index, file_url, success, file_path
     post_completed = pyqtSignal(str)
     log = pyqtSignal(str, str)
     finished = pyqtSignal()
+    # Thread status signals
+    thread_status = pyqtSignal(int, str, str, int, int, float, float)  # worker_id, status, filename, progress, file_size, speed, wait_start_time
 
-    def __init__(self, service, creator_id, download_folder, selected_posts, files_to_download, files_to_posts_map, console, other_files_dir, post_titles_map, auto_rename_enabled, settings, max_concurrent=20):
+    def __init__(self, service, creator_id, download_folder, selected_posts, files_to_download, files_to_posts_map, console, other_files_dir, post_titles_map, auto_rename_enabled, settings, max_concurrent=20, cache_dir=None):
         super().__init__()
         self.service = service
         self.creator_id = creator_id
@@ -606,8 +621,11 @@ class CreatorDownloadThread(QThread):
         self.settings = settings
         self.is_running = True
         self.other_files_dir = other_files_dir
-        self.hash_file_path = os.path.join(self.other_files_dir, "file_hashes.json")
-        self.file_hashes = self.load_hashes()
+        self.cache_dir = cache_dir if cache_dir else other_files_dir
+        hash_db_path = os.path.join(self.other_files_dir, "file_hashes.db")
+        self.hash_storage = HashStorage(hash_db_path)
+        stats_db_path = os.path.join(self.cache_dir, "stats.db")
+        self.stats_db = StatsDatabase(stats_db_path)
         self.max_concurrent = max_concurrent
         self.post_files_map = self.build_post_files_map()
         self.completed_files = set()
@@ -621,7 +639,6 @@ class CreatorDownloadThread(QThread):
         self.failed_files_lock = threading.Lock()
         self.post_file_counters_lock = threading.Lock()
         self.completed_files_lock = threading.Lock()
-        self.file_hashes_lock = threading.Lock()
 
     def _get_domain_config_from_files(self):
         """Determine domain configuration from the files to download"""
@@ -638,25 +655,6 @@ class CreatorDownloadThread(QThread):
             if post_id in post_files_map:
                 post_files_map[post_id].append(file_url)
         return post_files_map
-
-    def load_hashes(self):
-        os.makedirs(self.other_files_dir, exist_ok=True)
-        if os.path.exists(self.hash_file_path):
-            try:
-                with open(self.hash_file_path, 'r') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError) as e:
-                self.log.emit(translate("log_error", translate("failed_to_load_file_hashes", str(e))), "ERROR")
-                return {}
-        return {}
-
-    def save_hashes(self):
-        os.makedirs(self.other_files_dir, exist_ok=True)
-        try:
-            with open(self.hash_file_path, 'w') as f:
-                json.dump(self.file_hashes, f, indent=4)
-        except IOError as e:
-            self.log.emit(translate("log_error", translate("failed_to_save_file_hashes", str(e))), "ERROR")
 
     def fetch_creator_and_post_info(self):
         """Fetch creator name and retrieve post titles from post_titles_map."""
@@ -698,7 +696,7 @@ class CreatorDownloadThread(QThread):
     def stop(self):
         self.is_running = False
 
-    async def download_file(self, file_url, folder, file_index, total_files, session):
+    async def download_file(self, file_url, folder, file_index, total_files, session, worker_id=0):
         if not self.is_running or file_url not in self.files_to_download:
             self.log.emit(translate("log_info", f"Skipping {file_url}"), "INFO")
             return
@@ -715,7 +713,7 @@ class CreatorDownloadThread(QThread):
             self.log.emit(translate("log_error", error_msg), "ERROR")
             with self.failed_files_lock:
                 self.failed_files[file_url] = error_msg
-            self.file_completed.emit(file_index, file_url, False)
+            self.file_completed.emit(file_index, file_url, False, "")
             self.check_post_completion(file_url)
             return
 
@@ -742,22 +740,21 @@ class CreatorDownloadThread(QThread):
         full_path = os.path.join(post_folder, filename.replace('/', '_'))
         url_hash = hashlib.md5(file_url.encode()).hexdigest()
 
-        with self.file_hashes_lock:
-            file_hashes_keys = list(self.file_hashes.keys())
-
-        for hash_key in file_hashes_keys:
-            if hash_key == url_hash:
-                with self.file_hashes_lock:
-                    existing_path = self.file_hashes[hash_key]["file_path"]
-                if os.path.exists(existing_path):
-                    with open(existing_path, 'rb') as f:
-                        file_hash = hashlib.md5(f.read()).hexdigest()
-                    with self.file_hashes_lock:
-                        stored_hash = self.file_hashes[hash_key]["file_hash"]
+        # Check if file was already downloaded
+        hash_data = self.hash_storage.get(url_hash)
+        if hash_data:
+            existing_path = hash_data["file_path"]
+            if os.path.exists(existing_path):
+                # Use chunked hashing to avoid loading entire file into memory
+                file_hash = hash_file_chunked(existing_path)
+                if file_hash is None:
+                    self.log.emit(translate("log_error", f"Failed to hash file {existing_path}"), "ERROR")
+                else:
+                    stored_hash = hash_data["file_hash"]
                     if file_hash == stored_hash:
                         self.log.emit(translate("log_info", translate("file_already_downloaded", filename, existing_path)), "INFO")
                         self.file_progress.emit(file_index, 100)
-                        self.file_completed.emit(file_index, file_url, True)
+                        self.file_completed.emit(file_index, file_url, True, existing_path)
                         with self.completed_files_lock:
                             self.completed_files.add(file_url)
                         self.check_post_completion(file_url)
@@ -775,6 +772,12 @@ class CreatorDownloadThread(QThread):
                     response.raise_for_status()
                     file_size = int(response.headers.get('content-length', 0)) or 1
                     downloaded_size = 0
+                    start_time = time.time()
+                    last_update_time = start_time
+                    last_update_size = 0
+
+                    # Emit starting status
+                    self.thread_status.emit(worker_id, "downloading", filename, 0, file_size, 0.0, 0.0)
 
                     file_handle = open(full_path, 'wb')
                     async for chunk in response.content.iter_chunked(8192):
@@ -788,7 +791,7 @@ class CreatorDownloadThread(QThread):
                                     self.log.emit(translate("log_error", translate("failed_to_remove_interrupted_file", full_path, str(e))), "ERROR")
                             with self.failed_files_lock:
                                 self.failed_files[file_url] = "Download interrupted by user"
-                            self.file_completed.emit(file_index, file_url, False)
+                            self.file_completed.emit(file_index, file_url, False, "")
                             self.check_post_completion(file_url)
                             return
                         if chunk:
@@ -796,8 +799,19 @@ class CreatorDownloadThread(QThread):
                             downloaded_size += len(chunk)
                             progress = int((downloaded_size / file_size) * 100)
                             self.file_progress.emit(file_index, progress)
+
+                            # Update thread status every 0.5 seconds
+                            current_time = time.time()
+                            if current_time - last_update_time >= 0.5:
+                                elapsed = current_time - last_update_time
+                                bytes_since_update = downloaded_size - last_update_size
+                                speed = bytes_since_update / elapsed if elapsed > 0 else 0.0
+                                self.thread_status.emit(worker_id, "downloading", filename, progress, file_size, speed, 0.0)
+                                last_update_time = current_time
+                                last_update_size = downloaded_size
+
                             if progress == 100:
-                                self.file_completed.emit(file_index, file_url, True)
+                                self.file_completed.emit(file_index, file_url, True, full_path)
 
                     file_handle.close()
                     file_handle = None
@@ -816,19 +830,22 @@ class CreatorDownloadThread(QThread):
                         # Raise exception to trigger retry
                         raise Exception(f"Size mismatch: downloaded {downloaded_size} bytes, expected {file_size} bytes")
 
-                    with open(full_path, 'rb') as f:
-                        file_hash = hashlib.md5(f.read()).hexdigest()
-                    with self.file_hashes_lock:
-                        self.file_hashes[url_hash] = {
-                            "file_path": full_path,
-                            "file_hash": file_hash,
-                            "url": file_url
-                        }
-                        self.save_hashes()
+                    # Use chunked hashing to avoid loading entire file into memory
+                    file_hash = hash_file_chunked(full_path)
+                    if file_hash is None:
+                        raise Exception("Failed to hash downloaded file")
+
+                    # Store hash in database
+                    self.hash_storage.set(url_hash, full_path, file_hash, file_url)
+
+                    # Store file metadata and stats (images only for now)
+                    post_id = self.files_to_posts_map.get(file_url)
+                    self.stats_db.add_file_complete(full_path, file_hash, file_url, self.creator_id, post_id)
+
                     self.log.emit(translate("log_info", translate("successfully_downloaded", full_path)), "INFO")
                     with self.completed_files_lock:
                         self.completed_files.add(file_url)
-                    self.file_completed.emit(file_index, file_url, True)
+                    self.file_completed.emit(file_index, file_url, True, full_path)
                     self.check_post_completion(file_url)
                     return
 
@@ -842,7 +859,7 @@ class CreatorDownloadThread(QThread):
                     with self.failed_files_lock:
                         self.failed_files[file_url] = str(e)
                     self.file_progress.emit(file_index, 0)
-                    self.file_completed.emit(file_index, file_url, False)
+                    self.file_completed.emit(file_index, file_url, False, "")
                     self.check_post_completion(file_url)
                     return
                 else:
@@ -856,7 +873,7 @@ class CreatorDownloadThread(QThread):
                 with self.failed_files_lock:
                     self.failed_files[file_url] = str(e)
                 self.file_progress.emit(file_index, 0)
-                self.file_completed.emit(file_index, file_url, False)
+                self.file_completed.emit(file_index, file_url, False, "")
                 self.check_post_completion(file_url)
                 return
             finally:
@@ -871,17 +888,38 @@ class CreatorDownloadThread(QThread):
             if all(f in self.completed_files for f in post_files):
                 self.post_completed.emit(post_id)
 
-    async def download_worker(self, queue, folder, total_files, session):
+    async def download_worker(self, worker_id, queue, folder, total_files, session):
         while self.is_running:
             try:
-                file_index, file_url = await queue.get()
-                await self.download_file(file_url, folder, file_index, total_files, session)
+                # Emit idle status with wait start time
+                wait_start = time.time()
+
+                # Wait for file with periodic status updates
+                while True:
+                    try:
+                        self.thread_status.emit(worker_id, "waiting", "", 0, 0, 0.0, wait_start)
+                        file_index, file_url = await asyncio.wait_for(queue.get(), timeout=0.5)
+                        break
+                    except asyncio.TimeoutError:
+                        if not self.is_running:
+                            self.thread_status.emit(worker_id, "finished", "", 0, 0, 0.0, 0.0)
+                            return
+                        continue
+
+                # Check for sentinel value (None) to signal worker to stop
+                if file_url is None:
+                    queue.task_done()
+                    break
+
+                await self.download_file(file_url, folder, file_index, total_files, session, worker_id)
                 queue.task_done()
             except asyncio.QueueEmpty:
                 break
             except Exception as e:
                 self.log.emit(translate("log_error", translate("error_in_download_worker", str(e))), "ERROR")
                 queue.task_done()
+        # Emit finished status
+        self.thread_status.emit(worker_id, "finished", "", 0, 0, 0.0, 0.0)
 
     def run(self):
         if not self.is_running:
@@ -913,10 +951,15 @@ class CreatorDownloadThread(QThread):
                 async def main():
                     async with ClientSession() as session:
                         tasks = [
-                            loop.create_task(self.download_worker(queue, creator_folder, total_files, session))
-                            for _ in range(self.max_concurrent)
+                            loop.create_task(self.download_worker(worker_id, queue, creator_folder, total_files, session))
+                            for worker_id in range(self.max_concurrent)
                         ]
                         await queue.join()
+
+                        # Add sentinel values to signal workers to stop
+                        for _ in range(self.max_concurrent):
+                            queue.put_nowait((None, None))
+
                         await asyncio.gather(*tasks, return_exceptions=True)
 
                 loop.run_until_complete(main())
@@ -1133,7 +1176,9 @@ class CreatorDownloaderTab(QWidget):
         self.total_posts_to_download = 0
         self.total_files_to_download = 0
         self.completed_files = set()
+        self.completed_file_paths = []  # Track actual file paths for download folder detection
         self.failed_files = {}  # Map file_url to error message
+        self.extracted_links = {}  # Map post_id to extracted links dict
         # Locks for thread-safe access to shared data structures
         self.completed_files_lock = threading.Lock()
         self.failed_files_lock = threading.Lock()
@@ -1262,6 +1307,37 @@ class CreatorDownloaderTab(QWidget):
         creator_progress_layout.addWidget(self.creator_overall_progress)
         left_layout.addLayout(creator_progress_layout)
 
+        # Show thread monitor checkbox
+        self.show_thread_monitor_check = QCheckBox()
+        self.show_thread_monitor_check.setChecked(True)
+        self.show_thread_monitor_check.setStyleSheet("color: white;")
+        self.show_thread_monitor_check.stateChanged.connect(self.toggle_thread_monitor)
+        left_layout.addWidget(self.show_thread_monitor_check)
+
+        # Thread Monitor Panel
+        self.thread_monitor_group = QGroupBox()
+        self.thread_monitor_group.setStyleSheet("QGroupBox { color: white; font-weight: bold; padding: 10px; }")
+        thread_monitor_layout = QVBoxLayout()
+
+        # Thread monitor container with scroll area
+        from PyQt6.QtWidgets import QScrollArea
+        thread_scroll = QScrollArea()
+        thread_scroll.setWidgetResizable(True)
+        thread_scroll.setFixedHeight(150)
+        thread_scroll.setStyleSheet("QScrollArea { background: #1A2B4A; border-radius: 5px; }")
+
+        thread_container = QWidget()
+        self.thread_monitor_layout = QVBoxLayout(thread_container)
+        self.thread_monitor_layout.setSpacing(5)
+
+        # Dictionary to store thread status widgets
+        self.thread_status_widgets = {}
+
+        thread_scroll.setWidget(thread_container)
+        thread_monitor_layout.addWidget(thread_scroll)
+        self.thread_monitor_group.setLayout(thread_monitor_layout)
+        left_layout.addWidget(self.thread_monitor_group)
+
         # Console
         self.creator_console = QTextEdit()
         self.creator_console.setReadOnly(True)
@@ -1359,11 +1435,114 @@ class CreatorDownloaderTab(QWidget):
         # Initial text update
         self.update_ui_text()
 
+    def format_size(self, size_bytes):
+        """Format bytes to human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} TB"
+
+    def format_speed(self, bytes_per_second):
+        """Format speed to human readable format"""
+        return f"{self.format_size(bytes_per_second)}/s"
+
+    def update_thread_status(self, worker_id, status, filename, progress, file_size, speed, wait_start_time):
+        """Update or create thread status widget"""
+        if worker_id not in self.thread_status_widgets:
+            # Create new thread status widget
+            thread_widget = QWidget()
+            thread_layout = QHBoxLayout(thread_widget)
+            thread_layout.setContentsMargins(5, 3, 5, 3)
+
+            # Worker ID label
+            worker_label = QLabel(f"#{worker_id}")
+            worker_label.setStyleSheet("color: #8A9BBA; font-weight: bold; min-width: 30px;")
+            thread_layout.addWidget(worker_label)
+
+            # Status indicator (colored dot)
+            status_indicator = QLabel("●")
+            status_indicator.setStyleSheet("color: gray; font-size: 14px; min-width: 15px;")
+            thread_layout.addWidget(status_indicator)
+
+            # Filename label
+            filename_label = QLabel("Idle")
+            filename_label.setStyleSheet("color: white; min-width: 200px;")
+            filename_label.setWordWrap(False)
+            from PyQt6.QtCore import Qt
+            filename_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            thread_layout.addWidget(filename_label, 1)
+
+            # Progress bar
+            progress_bar = QProgressBar()
+            progress_bar.setFixedWidth(100)
+            progress_bar.setFixedHeight(15)
+            progress_bar.setStyleSheet("QProgressBar { border: 1px solid #4A5B7A; border-radius: 3px; background: #2A3B5A; text-align: center; } QProgressBar::chunk { background: #4A9B7A; }")
+            progress_bar.setTextVisible(True)
+            thread_layout.addWidget(progress_bar)
+
+            # Size/Speed label
+            info_label = QLabel("")
+            info_label.setStyleSheet("color: #8A9BBA; min-width: 120px; font-size: 10px;")
+            info_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+            thread_layout.addWidget(info_label)
+
+            thread_widget.setStyleSheet("background: #2A3B5A; border-radius: 5px; padding: 2px;")
+
+            self.thread_status_widgets[worker_id] = {
+                'widget': thread_widget,
+                'status_indicator': status_indicator,
+                'filename_label': filename_label,
+                'progress_bar': progress_bar,
+                'info_label': info_label
+            }
+
+            self.thread_monitor_layout.addWidget(thread_widget)
+
+        # Update existing widget
+        widgets = self.thread_status_widgets[worker_id]
+
+        # Update status indicator color
+        if status == "downloading":
+            widgets['status_indicator'].setStyleSheet("color: #4A9B7A; font-size: 14px; min-width: 15px;")
+            widgets['filename_label'].setText(filename[:40] + "..." if len(filename) > 40 else filename)
+            widgets['progress_bar'].setValue(progress)
+            size_text = self.format_size(file_size)
+            speed_text = self.format_speed(speed) if speed > 0 else ""
+            widgets['info_label'].setText(f"{size_text} | {speed_text}")
+        elif status == "waiting":
+            widgets['status_indicator'].setStyleSheet("color: #FFA500; font-size: 14px; min-width: 15px;")
+            widgets['filename_label'].setText("Waiting for file...")
+            widgets['progress_bar'].setValue(0)
+            if wait_start_time > 0:
+                wait_duration = int(time.time() - wait_start_time)
+                widgets['info_label'].setText(f"Waiting: {wait_duration}s")
+            else:
+                widgets['info_label'].setText("")
+        elif status == "finished":
+            widgets['status_indicator'].setStyleSheet("color: gray; font-size: 14px; min-width: 15px;")
+            widgets['filename_label'].setText("Idle")
+            widgets['progress_bar'].setValue(0)
+            widgets['info_label'].setText("")
+
+    def clear_thread_monitor(self):
+        """Clear all thread status widgets"""
+        for worker_id in list(self.thread_status_widgets.keys()):
+            widgets = self.thread_status_widgets[worker_id]
+            self.thread_monitor_layout.removeWidget(widgets['widget'])
+            widgets['widget'].deleteLater()
+        self.thread_status_widgets.clear()
+
+    def toggle_thread_monitor(self, state):
+        """Toggle thread monitor visibility"""
+        self.thread_monitor_group.setVisible(state == 2)  # 2 = Qt.CheckState.Checked
+
     def update_ui_text(self):
         self.creator_url_input.setPlaceholderText(translate("enter_creator_url"))
         self.creator_add_to_queue_btn.setText(translate("add_to_queue"))
         
         self.creator_queue_group.setTitle(translate("creator_queue"))
+        self.thread_monitor_group.setTitle(translate("thread_monitor"))
         self.creator_options_group.setTitle(translate("download_options"))
         self.creator_ext_group.setTitle(translate("file_extensions"))
         self.post_list_group.setTitle(translate("posts_to_download"))
@@ -1373,12 +1552,13 @@ class CreatorDownloaderTab(QWidget):
         self.creator_content_check.setText(translate("content_images"))
         self.creator_check_all.setText(translate("check_all"))
         self.creator_auto_rename_check.setText(translate("auto_rename"))
-        
+        self.show_thread_monitor_check.setText(translate("show_thread_monitor"))
+
         self.creator_file_progress_label.setText(translate("file_progress", 0))
         self.creator_overall_progress_label.setText(translate("overall_progress", 0, 0, 0, 0))
         self.creator_post_count_label.setText(translate("posts_count", 0))
         self.background_task_label.setText(translate("idle"))
-        
+
         self.creator_download_btn.setText(translate("download"))
         self.creator_cancel_btn.setText(translate("cancel"))
         self.creator_expand_logs_btn.setText(translate("expand_logs"))
@@ -1666,6 +1846,7 @@ class CreatorDownloaderTab(QWidget):
         )
         self.file_preparation_thread.progress.connect(self.update_background_progress)
         self.file_preparation_thread.finished.connect(lambda files, files_map: self.on_file_preparation_finished(urls, files, files_map))
+        self.file_preparation_thread.links_extracted.connect(self.store_extracted_links)
         self.file_preparation_thread.log.connect(self.append_log_to_console)
         self.file_preparation_thread.error.connect(self.on_file_preparation_error)
         self.active_threads.append(self.file_preparation_thread)
@@ -1705,11 +1886,13 @@ class CreatorDownloaderTab(QWidget):
         thread = CreatorDownloadThread(service, creator_id, self.parent.download_folder,
                                     self.posts_to_download, files_to_download, files_to_posts_map,
                                     self.creator_console, self.other_files_dir, self.post_titles_map,
-                                    self.creator_auto_rename_check.isChecked(), settings, settings.simultaneous_downloads)
+                                    self.creator_auto_rename_check.isChecked(), settings, settings.simultaneous_downloads,
+                                    cache_dir=self.cache_dir)
         thread.file_progress.connect(self.update_creator_file_progress)
         thread.file_completed.connect(self.update_file_completion)
         thread.post_completed.connect(self.update_post_completion)
         thread.log.connect(self.append_log_to_console)
+        thread.thread_status.connect(self.update_thread_status)
         thread.finished.connect(lambda: self.cleanup_thread(thread, remaining_urls))
         self.active_threads.append(thread)
         thread.start()
@@ -1721,6 +1904,42 @@ class CreatorDownloaderTab(QWidget):
         self.background_task_label.setText(translate("idle"))
         self.cleanup_file_preparation_thread()
         self.creator_download_finished()
+
+    def store_extracted_links(self, post_id, links_dict):
+        """Store extracted links from a post."""
+        if any(links_dict.values()):  # Only store if there are actual links
+            self.extracted_links[post_id] = links_dict
+            total_links = sum(len(v) for v in links_dict.values())
+            self.append_log_to_console(translate("log_info", f"Found {total_links} link(s) in post {post_id}"), "INFO")
+
+    def save_extracted_links(self):
+        """Save all extracted links to links.txt in the download folder."""
+        if not self.extracted_links:
+            return
+
+        # Get download folder from the first completed file path
+        if not self.completed_file_paths:
+            self.append_log_to_console(translate("log_warning", "No files downloaded, cannot save links file"), "WARNING")
+            return
+
+        # Extract creator folder (go up 2 levels: file -> post_folder -> creator_folder)
+        first_file = self.completed_file_paths[0]
+        post_folder = os.path.dirname(first_file)
+        creator_folder = os.path.dirname(post_folder)
+
+        links_file_path = os.path.join(creator_folder, "links.txt")
+        try:
+            formatted_content = format_links_file(self.extracted_links)
+
+            # Write the file
+            with open(links_file_path, 'w', encoding='utf-8') as f:
+                f.write(formatted_content)
+
+            # Log success only after file is written
+            total_links = sum(sum(len(v) for v in links.values()) for links in self.extracted_links.values())
+            self.append_log_to_console(translate("log_info", f"Saved {total_links} link(s) to {links_file_path}"), "INFO")
+        except Exception as e:
+            self.append_log_to_console(translate("log_error", f"Failed to save links file: {str(e)}"), "ERROR")
 
     def process_next_creator(self, remaining_urls):
         """Process the next creator or finish if no more remain."""
@@ -1823,27 +2042,27 @@ class CreatorDownloaderTab(QWidget):
             self.creator_file_progress.setValue(progress)
             self.creator_file_progress_label.setText(translate("file_progress", progress))
 
-    def update_file_completion(self, file_index, file_url, success):
+    def update_file_completion(self, file_index, file_url, success, file_path=""):
         """Update file completion status and check overall progress."""
         with self.completed_files_lock, self.failed_files_lock:
-            if file_url not in self.completed_files and file_url not in self.failed_files:
-                if success:
+            if success:
+                if file_url not in self.completed_files:
                     self.completed_files.add(file_url)
-                self.append_log_to_console(translate("log_debug", translate("file_completed", file_url, len(self.completed_files), self.total_files_to_download)), "INFO")
+                    if file_path:
+                        self.completed_file_paths.append(file_path)
+                    self.append_log_to_console(translate("log_debug", translate("file_completed", file_url, len(self.completed_files), self.total_files_to_download)), "INFO")
             else:
-                # Find the CreatorDownloadThread to get the error message
-                error_message = "Unknown error"
-                for thread in self.active_threads:
-                    if isinstance(thread, CreatorDownloadThread):
-                        error_message = thread.failed_files.get(file_url, "Unknown error")
-                        break
-                self.failed_files[file_url] = error_message
-                self.append_log_to_console(translate("log_debug", translate("file_failed", file_url, len(self.failed_files))), "INFO")
+                if file_url not in self.failed_files:
+                    # Find the CreatorDownloadThread to get the error message
+                    error_message = "Unknown error"
+                    for thread in self.active_threads:
+                        if isinstance(thread, CreatorDownloadThread):
+                            error_message = thread.failed_files.get(file_url, "Unknown error")
+                            break
+                    self.failed_files[file_url] = error_message
+                    self.append_log_to_console(translate("log_debug", translate("file_failed", file_url, len(self.failed_files))), "INFO")
             self.update_overall_progress()
-            # Check if all files have been attempted (successful or failed)
-            if self.total_files_to_download > 0 and len(self.completed_files) + len(self.failed_files) >= self.total_files_to_download:
-                self.append_log_to_console(translate("log_debug", translate("all_files_attempted")), "INFO")
-                self.creator_download_finished()
+            # Note: Don't trigger finish here - let cleanup_thread() handle it when thread actually completes
         if self.current_file_index == file_index:
             self.current_file_index = -1
             self.creator_file_progress.setValue(0)
@@ -1876,12 +2095,16 @@ class CreatorDownloaderTab(QWidget):
 
     def creator_download_finished(self):
         """Reset UI state after download completes or is cancelled."""
+        # Save extracted links before clearing
+        self.save_extracted_links()
+
         self.downloading = False
         self.parent.tabs.setTabEnabled(0, True)
         self.parent.status_label.setText(translate("idle"))
         self.creator_download_btn.setEnabled(True)
         self.creator_cancel_btn.setEnabled(False)
-        
+        self.clear_thread_monitor()
+
         # Log summary of failed files
         if self.failed_files:
             self.append_log_to_console(translate("log_warning", translate("download_completed_with_failed_files", len(self.failed_files))), "WARNING")
@@ -1898,6 +2121,8 @@ class CreatorDownloaderTab(QWidget):
         
         self.total_files_to_download = 0
         self.completed_files.clear()
+        self.completed_file_paths.clear()
+        self.extracted_links.clear()
         self.failed_files.clear()
         self.completed_posts.clear()
         self.current_file_index = -1
@@ -2013,10 +2238,11 @@ class CreatorDownloaderTab(QWidget):
 
     def cleanup_filter_thread(self):
         """Clean up the filter thread after it finishes."""
-        if self.filter_thread in self.active_threads:
-            self.active_threads.remove(self.filter_thread)
-        self.filter_thread.deleteLater()
-        self.filter_thread = None
+        if self.filter_thread is not None:
+            if self.filter_thread in self.active_threads:
+                self.active_threads.remove(self.filter_thread)
+            self.filter_thread.deleteLater()
+            self.filter_thread = None
             
     def add_list_item(self, text, url, is_checked):
         item = QListWidgetItem()
