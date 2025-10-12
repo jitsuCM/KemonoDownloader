@@ -18,6 +18,8 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 import subprocess
 from kemonodownloader.kd_language import translate
+from kemonodownloader.kd_utils import hash_file_chunked, HashStorage
+from kemonodownloader.kd_stats import StatsDatabase
 import locale
 import ctypes
 from fake_useragent import UserAgent
@@ -873,7 +875,7 @@ class DownloadThread(QThread):
     log = pyqtSignal(str, str)
     finished = pyqtSignal()
 
-    def __init__(self, url, download_folder, selected_files, files_to_posts_map, console, other_files_dir, post_id, settings, max_concurrent=5, auto_rename=False):
+    def __init__(self, url, download_folder, selected_files, files_to_posts_map, console, other_files_dir, post_id, settings, max_concurrent=5, auto_rename=False, cache_dir=None):
         super().__init__()
         self.url = url
         self.domain_config = get_domain_config(url)
@@ -884,8 +886,11 @@ class DownloadThread(QThread):
         self.console = console
         self.is_running = True
         self.other_files_dir = other_files_dir
-        self.hash_file_path = os.path.join(self.other_files_dir, "file_hashes.json")
-        self.file_hashes = self.load_hashes()
+        self.cache_dir = cache_dir if cache_dir else other_files_dir
+        hash_db_path = os.path.join(self.other_files_dir, "file_hashes.db")
+        self.hash_storage = HashStorage(hash_db_path)
+        stats_db_path = os.path.join(self.cache_dir, "stats.db")
+        self.stats_db = StatsDatabase(stats_db_path)
         self.max_concurrent = max_concurrent
         self.post_id = post_id
         self.service = self.extract_service_from_url(url)
@@ -894,7 +899,6 @@ class DownloadThread(QThread):
         self.post_title = None  # Store post title
         self.auto_rename = auto_rename
         # Locks for thread-safe access to shared dictionaries
-        self.file_hashes_lock = threading.Lock()
         self.completed_files_lock = threading.Lock()
 
     def fetch_post_info(self):
@@ -966,25 +970,6 @@ class DownloadThread(QThread):
                 post_files_map[post_id].append(file_url)
         return post_files_map
 
-    def load_hashes(self):
-        os.makedirs(self.other_files_dir, exist_ok=True)
-        if os.path.exists(self.hash_file_path):
-            try:
-                with open(self.hash_file_path, 'r') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError) as e:
-                self.log.emit(translate("log_error", f"Failed to load file hashes: {str(e)}"), "ERROR")
-                return {}
-        return {}
-
-    def save_hashes(self):
-        os.makedirs(self.other_files_dir, exist_ok=True)
-        try:
-            with open(self.hash_file_path, 'w') as f:
-                json.dump(self.file_hashes, f, indent=4)
-        except IOError as e:
-            self.log.emit(translate("log_error", f"Failed to save file hashes: {str(e)}"), "ERROR")
-
     def stop(self):
         self.is_running = False
         self.log.emit(translate("log_info", "DownloadThread cancellation initiated"), "INFO")
@@ -1011,18 +996,17 @@ class DownloadThread(QThread):
         full_path = os.path.join(post_folder, filename.replace('/', '_'))
         url_hash = hashlib.md5(file_url.encode()).hexdigest()
 
-        with self.file_hashes_lock:
-            file_hashes_keys = list(self.file_hashes.keys())
-
-        for hash_key in file_hashes_keys:
-            if hash_key == url_hash:
-                with self.file_hashes_lock:
-                    existing_path = self.file_hashes[hash_key]["file_path"]
-                if os.path.exists(existing_path):
-                    with open(existing_path, 'rb') as f:
-                        file_hash = hashlib.md5(f.read()).hexdigest()
-                    with self.file_hashes_lock:
-                        stored_hash = self.file_hashes[hash_key]["file_hash"]
+        # Check if file was already downloaded
+        hash_data = self.hash_storage.get(url_hash)
+        if hash_data:
+            existing_path = hash_data["file_path"]
+            if os.path.exists(existing_path):
+                # Use chunked hashing to avoid loading entire file into memory
+                file_hash = hash_file_chunked(existing_path)
+                if file_hash is None:
+                    self.log.emit(translate("log_error", f"Failed to hash file {existing_path}"), "ERROR")
+                else:
+                    stored_hash = hash_data["file_hash"]
                     if file_hash == stored_hash:
                         self.log.emit(translate("log_info", translate("file_already_downloaded", filename, existing_path)), "INFO")
                         self.file_progress.emit(file_index, 100)
@@ -1070,15 +1054,26 @@ class DownloadThread(QThread):
                     # Raise exception to trigger retry
                     raise Exception(f"Size mismatch: downloaded {downloaded_size} bytes, expected {file_size} bytes")
 
-                with open(full_path, 'rb') as f:
-                    file_hash = hashlib.md5(f.read()).hexdigest()
-                with self.file_hashes_lock:
-                    self.file_hashes[url_hash] = {
-                        "file_path": full_path,
-                        "file_hash": file_hash,
-                        "url": file_url
-                    }
-                    self.save_hashes()
+                # Use chunked hashing to avoid loading entire file into memory
+                file_hash = hash_file_chunked(full_path)
+                if file_hash is None:
+                    raise Exception("Failed to hash downloaded file")
+
+                # Store hash in database
+                self.hash_storage.set(url_hash, full_path, file_hash, file_url)
+
+                # Store file metadata and stats (images only for now)
+                # Extract creator_id from URL for post downloader
+                creator_id = None
+                try:
+                    parts = self.url.split('/')
+                    if len(parts) >= 4:
+                        creator_id = parts[-3]
+                except Exception:
+                    pass
+                post_id = self.files_to_posts_map.get(file_url, self.post_id)
+                self.stats_db.add_file_complete(full_path, file_hash, file_url, creator_id, post_id)
+
                 self.log.emit(translate("log_info", translate("successfully_downloaded", full_path)), "INFO")
                 with self.completed_files_lock:
                     self.completed_files.add(file_url)
@@ -1933,7 +1928,8 @@ class PostDownloaderTab(QWidget):
         max_concurrent = settings.simultaneous_downloads
         auto_rename = self.auto_rename_checkbox.isChecked()
         self.thread = DownloadThread(url, self.parent.download_folder, checked_files, files_to_posts_map,
-                                    self.post_console, self.other_files_dir, post_id, settings, max_concurrent, auto_rename)
+                                    self.post_console, self.other_files_dir, post_id, settings, max_concurrent, auto_rename,
+                                    cache_dir=self.cache_dir)
         self.active_threads.append(self.thread)
         self.thread.file_progress.connect(self.update_file_progress)
         self.thread.file_completed.connect(self.update_file_completion)

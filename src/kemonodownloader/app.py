@@ -15,12 +15,9 @@ from kemonodownloader.creator_downloader import CreatorDownloaderTab
 from kemonodownloader.kd_settings import SettingsTab
 from kemonodownloader.kd_help import HelpTab
 from kemonodownloader.kd_language import translate, language_manager
-from bs4 import MarkupResemblesLocatorWarning
-import warnings
+from kemonodownloader.kd_stats_window import StatsWindow
 
-warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
-
-CURRENT_VERSION = "5.4.0"
+CURRENT_VERSION = "5.3.0"
 GITHUB_REPO = "VoxDroid/KemonoDownloader"
 
 class VersionChecker(QThread):
@@ -256,6 +253,31 @@ class KemonoDownloader(QMainWindow):
         self.status_label.setStyleSheet("color: white; font-size: 12px;")
         footer_layout.addWidget(self.status_label)
         footer_layout.addStretch()
+
+        # Statistics button
+        self.stats_button = QPushButton(qta.icon('fa5s.chart-bar', color='white'), translate("view_statistics"))
+        self.stats_button.setStyleSheet("""
+            QPushButton {
+                background: #3A5B7A;
+                color: white;
+                border: none;
+                padding: 5px 15px;
+                border-radius: 5px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background: #4A6B9A;
+            }
+            QPushButton:pressed {
+                background: #2A4B6A;
+            }
+        """)
+        self.stats_button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.stats_button.clicked.connect(self.open_statistics_window)
+        footer_layout.addWidget(self.stats_button)
+
+        footer_layout.addSpacing(10)
+
         self.dev_label = QLabel(f"{translate('developed_by')} | GitHub: @VoxDroid | {translate('current_version', CURRENT_VERSION)}")
         self.dev_label.setStyleSheet("color: white; font-size: 12px;")
         footer_layout.addWidget(self.dev_label)
@@ -265,23 +287,25 @@ class KemonoDownloader(QMainWindow):
 
     def update_all_ui(self):
         self.setWindowTitle(translate("app_title"))
-        
+
         if self.centralWidget() == self.intro_screen:
             self.intro_screen.update_ui_text()
-        
+
         if self.main_widget:
             self.tabs.setTabText(0, translate("post_downloader_tab"))
             self.tabs.setTabText(1, translate("creator_downloader_tab"))
             self.tabs.setTabText(2, translate("settings_tab"))
             self.tabs.setTabText(3, translate("help_tab"))
-            
+
             if self.status_label.text() == "Idle" or self.status_label.text() == "アイドル" or self.status_label.text() == "대기 중":
                 self.status_label.setText(translate("idle"))
-            
+
+            self.stats_button.setText(translate("view_statistics"))
+
             self.dev_label.setText(f"{translate('developed_by')} | GitHub: @VoxDroid | {translate('current_version', CURRENT_VERSION)}")
-            
-            self.post_tab.refresh_ui()  
-            self.creator_tab.refresh_ui() 
+
+            self.post_tab.refresh_ui()
+            self.creator_tab.refresh_ui()
             self.settings_tab.update_ui_text()
             self.help_tab.update_ui_text()
 
@@ -402,7 +426,12 @@ class KemonoDownloader(QMainWindow):
         else:
             anim.setEndValue(rect.adjusted(3, 3, -3, -3))
         anim.start()
-        
+
+    def open_statistics_window(self):
+        """Open the statistics window"""
+        stats_window = StatsWindow(self, self.base_folder)
+        stats_window.show()
+
     def log(self, message):
         self.status_label.setText(message)
         print(message)
