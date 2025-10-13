@@ -3,9 +3,9 @@ import os
 import requests
 from packaging import version
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, 
-    QHBoxLayout, QLabel, QPushButton, QGraphicsDropShadowEffect, 
-    QTabWidget, QMessageBox
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QHBoxLayout, QLabel, QPushButton, QGraphicsDropShadowEffect,
+    QTabWidget, QMessageBox, QProgressDialog
 )
 from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QPalette, QFont, QCursor, QIcon
@@ -428,9 +428,45 @@ class KemonoDownloader(QMainWindow):
         anim.start()
 
     def open_statistics_window(self):
-        """Open the statistics window"""
+        """Open the statistics window with loading dialog"""
+        # Create loading dialog
+        progress = QProgressDialog("Loading statistics...", None, 0, 0, self)
+        progress.setWindowTitle("Please Wait")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.setStyleSheet("""
+            QProgressDialog {
+                background-color: #2A3B5A;
+                border: 1px solid #3A4B6A;
+                border-radius: 8px;
+            }
+            QProgressDialog QLabel {
+                color: #FFFFFF;
+                font-size: 14px;
+                padding: 10px;
+            }
+            QProgressBar {
+                border: 1px solid #4A5B7A;
+                border-radius: 5px;
+                background: #1A2A44;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4A6B9A, stop:1 #5A7BA9);
+                border-radius: 5px;
+            }
+        """)
+        progress.show()
+        QApplication.processEvents()
+
+        # Create and show stats window
         stats_window = StatsWindow(self, self.base_folder)
         stats_window.show()
+
+        # Close progress dialog
+        progress.close()
 
     def log(self, message):
         self.status_label.setText(message)

@@ -18,6 +18,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 import subprocess
 from kemonodownloader.kd_language import translate
+from kemonodownloader.kd_link_handler import DownloadedLinksWindow, extract_links
 from kemonodownloader.kd_utils import hash_file_chunked, HashStorage
 from kemonodownloader.kd_stats import StatsDatabase
 import locale
@@ -526,6 +527,7 @@ class PostDetectionThread(QThread):
     log = pyqtSignal(str, str)
     error = pyqtSignal(str)
     file_detected = pyqtSignal(list)
+    links_extracted = pyqtSignal(str, dict)  # Signal to emit (post_id, links_dict)
 
     def __init__(self, url, settings):
         super().__init__()
@@ -562,7 +564,16 @@ class PostDetectionThread(QThread):
             post = post_data if isinstance(post_data, dict) and 'post' not in post_data else post_data.get('post', {})
             detected_files = [(post.get('title', f"File {post_id}"), post_id)]
             self.log.emit(translate("log_info", f"Post fetched for {self.url}: {post.get('title', f'File {post_id}')}"), "INFO")
-            
+
+            # Extract links from post content
+            post_content = post.get('content', '')
+            if post_content:
+                extracted_links = extract_links(post_content)
+                total_links = sum(len(links) for links in extracted_links.values())
+                if total_links > 0:
+                    self.links_extracted.emit(post_id, extracted_links)
+                    self.log.emit(translate("log_info", f"Extracted {total_links} link(s) from post {post_id}"), "INFO")
+
             files = self.detect_files(post)
             if self.is_running:
                 self.file_detected.emit(files)
@@ -852,8 +863,10 @@ def sanitize_filename(name, max_length=100):
     """Sanitize a filename by removing invalid characters, trailing dots, and limiting length."""
     if not name:
         return "unnamed"
+    # Remove newlines and carriage returns
+    sanitized = name.replace('\n', '_').replace('\r', '_')
     # Remove invalid characters
-    sanitized = re.sub(r'[<>:"/\\|?*]', '_', name)
+    sanitized = re.sub(r'[<>:"/\\|?*]', '_', sanitized)
     # Replace spaces with underscores
     sanitized = sanitized.replace(' ', '_')
     # Remove multiple consecutive underscores
@@ -1233,9 +1246,11 @@ class PostDownloaderTab(QWidget):
         self.post_url_map = {}
         self.total_files_to_download = 0
         self.completed_files = set()
+        self.completed_file_paths = []  # Track actual file paths for the view links feature
         self.completed_posts = set()
         self.total_posts_to_download = 0
         self.detected_files_during_check_all = []
+        self.extracted_links = {}  # Map post_id to extracted links dict
         os.makedirs(self.cache_dir, exist_ok=True)
         os.makedirs(self.other_files_dir, exist_ok=True)
         self.setup_ui()
@@ -1294,6 +1309,13 @@ class PostDownloaderTab(QWidget):
         self.post_overall_progress.setRange(0, 100)
         post_progress_layout.addWidget(self.post_overall_progress)
         left_layout.addLayout(post_progress_layout)
+
+        # View Extracted Links button
+        self.post_view_links_btn = QPushButton(qta.icon('fa5s.link', color='white'), "View Extracted Links")
+        self.post_view_links_btn.clicked.connect(self.open_downloaded_links_window)
+        self.post_view_links_btn.setStyleSheet("background: #4A5B7A; padding: 8px; border-radius: 5px; color: white;")
+        self.post_view_links_btn.setVisible(False)  # Hidden by default
+        left_layout.addWidget(self.post_view_links_btn)
 
         # Console
         self.post_console = QTextEdit()
@@ -1622,10 +1644,17 @@ class PostDownloaderTab(QWidget):
             self.post_detection_thread.finished.connect(self.on_post_detection_finished)
             self.post_detection_thread.log.connect(self.append_log_to_console)
             self.post_detection_thread.error.connect(self.on_post_detection_error)
+            self.post_detection_thread.links_extracted.connect(self.on_links_extracted)
             self.post_detection_thread.finished.connect(lambda posts: self.cleanup_thread(self.post_detection_thread, []))
             self.post_detection_thread.error.connect(lambda err: self.cleanup_thread(self.post_detection_thread, []))
             self.active_threads.append(self.post_detection_thread)
             self.post_detection_thread.start()
+
+    def on_links_extracted(self, post_id, links_dict):
+        """Store extracted links from post content."""
+        self.extracted_links[post_id] = links_dict
+        total_links = sum(len(links) for links in links_dict.values())
+        self.append_log_to_console(translate("log_info", f"Stored {total_links} link(s) from post {post_id}"), "INFO")
 
     def on_post_detection_finished(self, detected_posts):
         self.all_files_map[self.current_post_url] = detected_posts
@@ -1819,9 +1848,12 @@ class PostDownloaderTab(QWidget):
         self.parent.status_label.setText(translate("preparing_files"))
         self.post_download_btn.setEnabled(False)
         self.post_cancel_btn.setEnabled(True)
+        self.post_view_links_btn.setVisible(False)  # Hide the button when starting download
         self.post_overall_progress.setValue(0)
         self.completed_posts.clear()
         self.completed_files.clear()
+        self.completed_file_paths.clear()
+        self.extracted_links.clear()  # Clear extracted links when starting new download
         self.total_files_to_download = 0
         self.post_overall_progress_label.setText(translate("overall_progress", 0, 0, 0, 0))
         self.current_file_index = -1
@@ -2037,6 +2069,19 @@ class PostDownloaderTab(QWidget):
         self.append_log_to_console(translate("log_info", translate("post_fully_downloaded", post_id)), "INFO")
         self.update_overall_progress()
 
+    def open_downloaded_links_window(self):
+        """Open a window displaying all extracted links from posts."""
+        if not self.extracted_links:
+            self.append_log_to_console(translate("log_warning", "No links were extracted from posts"), "WARNING")
+            return
+
+        # Create a copy of the extracted links dict to pass to the window
+        extracted_links_copy = self.extracted_links.copy()
+
+        # Open the window
+        links_window = DownloadedLinksWindow(extracted_links_copy, self)
+        links_window.show()
+
     def post_download_finished(self):
         self.downloading = False
         self.parent.tabs.setTabEnabled(1, True)
@@ -2044,14 +2089,20 @@ class PostDownloaderTab(QWidget):
         self.post_download_btn.setEnabled(True)
         self.post_cancel_btn.setEnabled(False)
         self.append_log_to_console(translate("log_info", translate("download_process_ended")), "INFO")
-        
+
         if self.total_files_to_download > 0 and len(self.completed_files) == self.total_files_to_download:
             self.post_file_progress.setStyleSheet("QProgressBar { border: 1px solid #4A5B7A; border-radius: 5px; background: #2A3B5A; } QProgressBar::chunk { background: green; }")
             self.post_overall_progress.setStyleSheet("QProgressBar { border: 1px solid #4A5B7A; border-radius: 5px; background: #2A3B5A; } QProgressBar::chunk { background: green; }")
             self.post_overall_progress_label.setText(translate("downloads_complete"))
-        
+
+        # Show the "View Downloaded Links" button if links were extracted
+        if self.extracted_links:
+            self.post_view_links_btn.setVisible(True)
+
         self.total_files_to_download = 0
         self.completed_files.clear()
+        self.completed_file_paths.clear()
+        # Don't clear extracted_links here - keep them for the View Links button
         self.background_task_progress.setRange(0, 100)
         self.background_task_progress.setValue(0)
         self.background_task_label.setText(translate("idle"))

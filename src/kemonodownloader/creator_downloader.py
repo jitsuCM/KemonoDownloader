@@ -15,7 +15,7 @@ import qtawesome as qta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from kemonodownloader.kd_language import translate
-from kemonodownloader.kd_link_handler import extract_links, format_links_file
+from kemonodownloader.kd_link_handler import extract_links, format_links_file, DownloadedLinksWindow
 from kemonodownloader.kd_utils import hash_file_chunked, HashStorage
 from kemonodownloader.kd_stats import StatsDatabase
 import locale
@@ -584,8 +584,10 @@ def sanitize_filename(name, max_length=100):
     """Sanitize a filename by removing invalid characters, trailing dots, and limiting length."""
     if not name:
         return "unnamed"
+    # Remove newlines and carriage returns
+    sanitized = name.replace('\n', '_').replace('\r', '_')
     # Remove invalid characters
-    sanitized = re.sub(r'[<>:"/\\|?*]', '_', name)
+    sanitized = re.sub(r'[<>:"/\\|?*]', '_', sanitized)
     # Replace spaces with underscores
     sanitized = sanitized.replace(' ', '_')
     # Remove multiple consecutive underscores
@@ -770,7 +772,15 @@ class CreatorDownloadThread(QThread):
                 headers['Referer'] = self.domain_config['referer']
                 async with session.get(file_url, headers=headers, timeout=ClientTimeout(total=3600)) as response:
                     response.raise_for_status()
-                    file_size = int(response.headers.get('content-length', 0)) or 1
+                    # Parse content-length safely, default to 1 if invalid or missing
+                    try:
+                        content_length = response.headers.get('content-length', '0')
+                        file_size = int(content_length)
+                        # Ensure file_size is positive
+                        if file_size <= 0:
+                            file_size = 1
+                    except (ValueError, TypeError):
+                        file_size = 1
                     downloaded_size = 0
                     start_time = time.time()
                     last_update_time = start_time
@@ -1307,6 +1317,13 @@ class CreatorDownloaderTab(QWidget):
         creator_progress_layout.addWidget(self.creator_overall_progress)
         left_layout.addLayout(creator_progress_layout)
 
+        # View Extracted Links button
+        self.creator_view_links_btn = QPushButton(qta.icon('fa5s.link', color='white'), "View Extracted Links")
+        self.creator_view_links_btn.clicked.connect(self.open_downloaded_links_window)
+        self.creator_view_links_btn.setStyleSheet("background: #4A5B7A; padding: 8px; border-radius: 5px; color: white;")
+        self.creator_view_links_btn.setVisible(False)  # Hidden by default
+        left_layout.addWidget(self.creator_view_links_btn)
+
         # Show thread monitor checkbox
         self.show_thread_monitor_check = QCheckBox()
         self.show_thread_monitor_check.setChecked(True)
@@ -1437,6 +1454,11 @@ class CreatorDownloaderTab(QWidget):
 
     def format_size(self, size_bytes):
         """Format bytes to human readable format"""
+        # Handle negative or invalid values
+        if size_bytes < 0:
+            return "Unknown"
+        if size_bytes == 0:
+            return "0 B"
         for unit in ['B', 'KB', 'MB', 'GB']:
             if size_bytes < 1024.0:
                 return f"{size_bytes:.1f} {unit}"
@@ -1787,10 +1809,13 @@ class CreatorDownloaderTab(QWidget):
         self.parent.status_label.setText(translate("preparing_files"))
         self.creator_download_btn.setEnabled(False)
         self.creator_cancel_btn.setEnabled(True)
+        self.creator_view_links_btn.setVisible(False)  # Hide the button when starting download
         self.creator_overall_progress.setValue(0)
         self.total_posts_to_download = len(self.posts_to_download)
         self.completed_posts.clear()
         self.completed_files.clear()
+        self.completed_file_paths.clear()
+        self.extracted_links.clear()  # Clear extracted links when starting new download
         self.total_files_to_download = 0
         self.creator_overall_progress_label.setText(translate("overall_progress", 0, 0, 0, self.total_posts_to_download))
         self.current_file_index = -1
@@ -1940,6 +1965,19 @@ class CreatorDownloaderTab(QWidget):
             self.append_log_to_console(translate("log_info", f"Saved {total_links} link(s) to {links_file_path}"), "INFO")
         except Exception as e:
             self.append_log_to_console(translate("log_error", f"Failed to save links file: {str(e)}"), "ERROR")
+
+    def open_downloaded_links_window(self):
+        """Open a window displaying all extracted links from posts."""
+        if not self.extracted_links:
+            self.append_log_to_console(translate("log_warning", "No links were extracted from posts"), "WARNING")
+            return
+
+        # Create a copy of the extracted links dict to pass to the window
+        extracted_links_copy = self.extracted_links.copy()
+
+        # Open the window
+        links_window = DownloadedLinksWindow(extracted_links_copy, self)
+        links_window.show()
 
     def process_next_creator(self, remaining_urls):
         """Process the next creator or finish if no more remain."""
@@ -2118,11 +2156,15 @@ class CreatorDownloaderTab(QWidget):
         self.creator_overall_progress.setStyleSheet("QProgressBar { border: 1px solid #4A5B7A; border-radius: 5px; background: #2A3B5A; } QProgressBar::chunk { background: green; }")
         self.creator_file_progress_label.setText(translate("downloads_complete"))
         self.creator_overall_progress_label.setText(translate("downloads_complete"))
-        
+
+        # Show the "View Downloaded Links" button if links were extracted
+        if self.extracted_links:
+            self.creator_view_links_btn.setVisible(True)
+
         self.total_files_to_download = 0
         self.completed_files.clear()
         self.completed_file_paths.clear()
-        self.extracted_links.clear()
+        # Don't clear extracted_links here - keep them for the View Links button
         self.failed_files.clear()
         self.completed_posts.clear()
         self.current_file_index = -1

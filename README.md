@@ -132,6 +132,8 @@ We are committed to fostering a welcoming and respectful community around Kemono
   - [Post Downloader Tab](#post-downloader-tab)
   - [Creator Downloader Tab](#creator-downloader-tab)
   - [Settings Tab](#settings-tab)
+  - [Thread Monitor](#thread-monitor)
+  - [Statistics Dashboard](#statistics-dashboard)
   - [Help Tab](#help-tab)
 - [Screenshots](#screenshots)
 - [Releases](#releases)
@@ -150,6 +152,8 @@ We are committed to fostering a welcoming and respectful community around Kemono
 - **Creator Archiving**: Bulk download all posts and files from a creator's profile with a single click.
 - **File Type Support**: Handle images (JPG, PNG, GIF), videos (MP4), archives (ZIP, 7Z), PDFs, and more.
 - **Concurrent Downloads**: Adjust the number of simultaneous downloads (1-10) for optimal performance.
+- **Thread Monitor**: Watch your download threads work in real-time with live status indicators, progress bars, file sizes, and download speeds for each worker. It's oddly satisfying to see them all hustling at once.
+- **Download Statistics Dashboard**: Track your entire collection with beautiful charts and graphs. Check out resolution heatmaps, file size distributions, codec breakdowns, and historical trends. Perfect for those who like their data visualization as clean as their folder organization.
 - **File Deduplication**: Prevent redundant downloads using URL hashes.
 - **Image Previews**: Preview images before downloading to verify content.
 - **Detailed Logging**: Track progress and troubleshoot issues with an in-app console.
@@ -232,11 +236,31 @@ Upon launching, you’ll see an introductory screen with a "Launch" button. Clic
   4. Click "Download" to begin, and track progress via the interface.
 
 ### Settings Tab
-- **Purpose**: Customize the application’s behavior.
+- **Purpose**: Customize the application's behavior.
 - **How to Use**:
   1. Set the folder name and save directory for downloads.
   2. Adjust simultaneous downloads (1-10) using the slider or spinbox.
   3. Click "Apply Changes" to save.
+
+### Thread Monitor
+- **Purpose**: Real-time visualization of your download workers doing their thing.
+- **How to Use**:
+  1. Enable "Show thread monitor" checkbox in the Creator Downloader tab during an active download.
+  2. Watch each thread's status with color-coded indicators (green = downloading, yellow = waiting, gray = idle).
+  3. See live progress bars, file sizes, and download speeds for each worker thread.
+  4. Great for monitoring performance and knowing exactly what's happening under the hood.
+
+### Statistics Dashboard
+- **Purpose**: Dive deep into your download collection with detailed analytics and visualizations.
+- **How to Use**:
+  1. Click "View Statistics" button in the Creator Downloader tab (available after downloads complete).
+  2. Navigate through tabs to explore different aspects of your collection:
+     - **General**: Summary stats, historical trends, media type distributions, and file size breakdowns.
+     - **Images**: Resolution heatmaps, format distributions, color mode analysis, and file size patterns.
+     - **Videos**: Codec distributions, resolution analysis, duration stats, frame rates, and bitrate data.
+     - **Animations/Audio/Creators/Advanced**: Additional specialized analytics.
+  3. All charts are interactive and update based on your actual downloaded content.
+  4. Perfect for data enthusiasts who want to know everything about their collection.
 
 ### Help Tab
 - **Purpose**: Access the embedded user manual.
@@ -244,7 +268,7 @@ Upon launching, you’ll see an introductory screen with a "Launch" button. Clic
 
 ## Screenshots
 
-Here are previews of the main tabs in Kemono Downloader:
+Here are previews of the main tabs and features in Kemono Downloader:
 
 <table align="center">
   <tr>
@@ -266,7 +290,31 @@ Here are previews of the main tabs in Kemono Downloader:
       <strong>Settings Tab</strong>
     </td>
     <td align="center">
-      <!-- Placeholder for potential fourth screenshot -->
+      <img src="assets/previews/kd_thread_stats.JPG" alt="Thread Monitor" width="400"/>
+      <br>
+      <strong>Thread Monitor - Real-time Download Status</strong>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="assets/previews/kd_stats_general.JPG" alt="Stats Dashboard General" width="400"/>
+      <br>
+      <strong>Statistics Dashboard - General Overview</strong>
+    </td>
+    <td align="center">
+      <img src="assets/previews/kd_stats_images.JPG" alt="Stats Dashboard Images" width="400"/>
+      <br>
+      <strong>Statistics Dashboard - Image Analytics</strong>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="assets/previews/kd_stats_video.JPG" alt="Stats Dashboard Videos" width="400"/>
+      <br>
+      <strong>Statistics Dashboard - Video Analytics</strong>
+    </td>
+    <td align="center">
+      <!-- Placeholder for future screenshots -->
     </td>
   </tr>
 </table>
